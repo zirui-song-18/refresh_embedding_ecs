@@ -1,0 +1,11 @@
+version = 0.1
+[default.deploy.parameters]
+stack_name = "poc-ecs-reindex"
+resolve_s3 = true
+s3_prefix = "poc-ecs-reindex"
+region = "us-west-2"
+confirm_changeset = true
+capabilities = "CAPABILITY_NAMED_IAM"
+disable_rollback = true
+parameter_overrides = "CollectionEndpoint=\"https://5l2oxy87av1hbwupnpoc.us-west-2.aoss.amazonaws.com\" ECSImageUri=\"330700426359.dkr.ecr.us-west-2.amazonaws.com/reindex-ecs-tasks:latest\" SubnetIds=\"subnet-060c69bcc19538041,subnet-0435875c5da539c47\" ECSTaskCpu=\"1024\" ECSTaskMemory=\"2048\""
+image_repositories = []
