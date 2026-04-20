@@ -2,8 +2,11 @@
 
 import json
 import logging
+import re
 
 from aoss_client import aoss_request
+
+VALID_FIELD_PATTERN = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -33,6 +36,11 @@ def handler(event, context):
     pipeline_name = event["pipeline_name"]
     model_id = event["model_id"]
     dimension = event["dimension"]
+
+    # Validate field names to prevent Painless script injection
+    for field_name, field_label in [(v1_field, "v1_field"), (v2_field, "v2_field"), (text_field, "text_field")]:
+        if not VALID_FIELD_PATTERN.match(field_name):
+            raise ValueError(f"Invalid {field_label}: '{field_name}'. Must match pattern {VALID_FIELD_PATTERN.pattern}")
 
     # Step 1: Add v2 knn_vector field to mapping
     logger.info(f"Adding {v2_field} field (dim={dimension}) to index {index_name}")

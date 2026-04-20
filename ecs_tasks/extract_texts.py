@@ -31,10 +31,15 @@ def main():
     logger.info(f"ExtractTexts starting: index={index_name}, v2_field={v2_field}")
     logger.info(f"Output: s3://{s3_bucket}/{s3_prefix}/texts/")
 
+    # Clean up old data from previous round (needed for retry loops)
+    _cleanup_s3_prefix(s3_bucket, f"{s3_prefix}/texts/")
+    _cleanup_s3_prefix(s3_bucket, f"{s3_prefix}/embeddings/")
+    logger.info("Cleaned up old texts/ and embeddings/ from S3")
+
     # Create PIT
     pit_resp = aoss_request(
         endpoint, "POST",
-        f"{index_name}/_search/point_in_time?keep_alive=5m",
+        f"{index_name}/_search/point_in_time?keep_alive=15m",
     )
     pit_id = pit_resp["pit_id"]
     logger.info(f"PIT created")
@@ -52,7 +57,7 @@ def main():
                 "size": SEARCH_PAGE_SIZE,
                 "_source": [text_field],
                 "query": {"bool": {"must_not": {"exists": {"field": v2_field}}}},
-                "pit": {"id": pit_id, "keep_alive": "5m"},
+                "pit": {"id": pit_id, "keep_alive": "15m"},
                 "sort": [{"_doc": "asc"}],
             }
             if search_after:
@@ -114,6 +119,24 @@ def main():
         Body=json.dumps(summary).encode("utf-8"),
     )
     logger.info(f"Summary written to s3://{s3_bucket}/{s3_prefix}/extract_summary.json")
+
+    if total_extracted == 0:
+        logger.warning("No documents extracted — all docs may already have v2 (expected on final retry)")
+        # Do NOT exit 1 here: retry loop may reach this state legitimately
+
+
+def _cleanup_s3_prefix(s3_bucket, prefix):
+    """Delete all objects under an S3 prefix."""
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=s3_bucket, Prefix=prefix):
+        objects = page.get("Contents", [])
+        if not objects:
+            continue
+        s3.delete_objects(
+            Bucket=s3_bucket,
+            Delete={"Objects": [{"Key": obj["Key"]} for obj in objects]},
+        )
+        logger.info(f"Deleted {len(objects)} objects from s3://{s3_bucket}/{prefix}")
 
 
 def _flush_chunk(s3_bucket, s3_prefix, chunk_num, lines):

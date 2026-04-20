@@ -1,24 +1,39 @@
 {
-  "Comment": "Dual-field reindex: ECS for heavy tasks, Lambda for light tasks",
+  "Comment": "Dual-field reindex: ECS for heavy tasks, Lambda for light tasks, with retry loop for 100% completion",
   "StartAt": "Prepare",
   "States": {
     "Prepare": {
       "Type": "Task",
       "Resource": "${PrepareFunctionArn}",
       "ResultPath": "$.prepare_result",
-      "Next": "ExtractTexts",
+      "Next": "InitRetryState",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
           "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0
         }
       ],
       "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }]
     },
 
+    "InitRetryState": {
+      "Type": "Pass",
+      "Result": { "retry_count": 0 },
+      "ResultPath": "$.retry_state",
+      "Next": "WaitBeforeExtract"
+    },
+
+    "WaitBeforeExtract": {
+      "Type": "Wait",
+      "Seconds": 130,
+      "Comment": "Wait 2 AOSS refresh cycles (~60s each) so PIT captures all docs",
+      "Next": "ExtractTexts"
+    },
+
     "ExtractTexts": {
       "Type": "Task",
       "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "TimeoutSeconds": 14400,
       "Parameters": {
         "LaunchType": "FARGATE",
         "Cluster": "${ECSClusterArn}",
@@ -51,7 +66,7 @@
       "Next": "StartEmbeddingJob",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed"],
+          "ErrorEquals": ["States.TaskFailed", "ECS.AmazonECSException"],
           "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2.0
         }
       ],
@@ -73,13 +88,14 @@
         "pipeline_name.$": "$.pipeline_name",
         "search_pipeline_name.$": "$.search_pipeline_name",
         "model_id.$": "$.model_id",
-        "v1_field.$": "$.v1_field"
+        "v1_field.$": "$.v1_field",
+        "chunk_size.$": "$.prepare_result.chunk_size"
       },
       "ResultPath": "$.job_result",
       "Next": "WaitForEmbeddingJob",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
           "IntervalSeconds": 10, "MaxAttempts": 2, "BackoffRate": 2.0
         }
       ],
@@ -100,7 +116,7 @@
       "Next": "IsJobComplete",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
           "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0
         }
       ],
@@ -119,6 +135,7 @@
     "WriteEmbeddings": {
       "Type": "Task",
       "Resource": "arn:aws:states:::ecs:runTask.sync",
+      "TimeoutSeconds": 43200,
       "Parameters": {
         "LaunchType": "FARGATE",
         "Cluster": "${ECSClusterArn}",
@@ -136,11 +153,11 @@
             "Name": "main",
             "Environment": [
               { "Name": "TASK_TYPE", "Value": "write_embeddings" },
-              { "Name": "COLLECTION_ENDPOINT", "Value.$": "$.job_status.collection_endpoint" },
-              { "Name": "INDEX_NAME", "Value.$": "$.job_status.index_name" },
-              { "Name": "V2_FIELD", "Value.$": "$.job_status.v2_field" },
-              { "Name": "S3_BUCKET", "Value.$": "$.job_status.s3_bucket" },
-              { "Name": "S3_PREFIX", "Value.$": "$.job_status.s3_prefix" }
+              { "Name": "COLLECTION_ENDPOINT", "Value.$": "$.collection_endpoint" },
+              { "Name": "INDEX_NAME", "Value.$": "$.index_name" },
+              { "Name": "V2_FIELD", "Value.$": "$.v2_field" },
+              { "Name": "S3_BUCKET", "Value.$": "$.s3_bucket" },
+              { "Name": "S3_PREFIX", "Value.$": "$.s3_prefix" }
             ]
           }]
         }
@@ -149,7 +166,7 @@
       "Next": "WaitForRefresh",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed"],
+          "ErrorEquals": ["States.TaskFailed", "ECS.AmazonECSException"],
           "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2.0
         }
       ],
@@ -166,11 +183,10 @@
       "Type": "Task",
       "Resource": "${CompletenessCheckFunctionArn}",
       "Parameters": {
-        "collection_endpoint.$": "$.job_status.collection_endpoint",
-        "index_name.$": "$.job_status.index_name",
-        "v2_field.$": "$.job_status.v2_field",
-        "text_field.$": "$.job_status.text_field",
-        "sagemaker_endpoint_name": "unused",
+        "collection_endpoint.$": "$.collection_endpoint",
+        "index_name.$": "$.index_name",
+        "v2_field.$": "$.v2_field",
+        "text_field.$": "$.text_field",
         "pipeline_name.$": "$.pipeline_name",
         "search_pipeline_name.$": "$.search_pipeline_name",
         "model_id.$": "$.model_id",
@@ -180,7 +196,7 @@
       "Next": "IsComplete",
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
           "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0
         }
       ],
@@ -192,13 +208,30 @@
       "Choices": [
         { "Variable": "$.check_result.complete", "BooleanEquals": true, "Next": "Switch" }
       ],
-      "Default": "HandleIncomplete"
+      "Default": "IncrementRetryCount"
     },
 
-    "HandleIncomplete": {
+    "IncrementRetryCount": {
       "Type": "Pass",
-      "Comment": "Some docs missing v2 (concurrent writes). Proceed to switch for now.",
-      "Next": "Switch"
+      "Parameters": {
+        "retry_count.$": "States.MathAdd($.retry_state.retry_count, 1)"
+      },
+      "ResultPath": "$.retry_state",
+      "Next": "CheckRetryLimit"
+    },
+
+    "CheckRetryLimit": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.retry_state.retry_count", "NumericGreaterThanEquals": 5, "Next": "RetryExhausted" }
+      ],
+      "Default": "WaitBeforeExtract"
+    },
+
+    "RetryExhausted": {
+      "Type": "Fail",
+      "Cause": "Reindex incomplete after 5 retry rounds. Not all documents have v2 embeddings.",
+      "Error": "RetryExhaustedError"
     },
 
     "Switch": {
@@ -208,7 +241,7 @@
       "End": true,
       "Retry": [
         {
-          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException"],
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
           "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0
         }
       ],

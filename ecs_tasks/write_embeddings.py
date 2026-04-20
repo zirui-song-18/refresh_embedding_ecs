@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import sys
 import time
 
 import boto3
@@ -90,6 +91,14 @@ def main():
         Body=json.dumps(summary).encode("utf-8"),
     )
 
+    # Only fail hard if ALL writes failed — indicates fundamental issue (permissions, wrong endpoint)
+    # Partial failures are handled by the CompletenessCheck + retry loop
+    total_processed = total_written + total_noop + total_not_found + total_failures
+    if total_processed > 0 and total_written == 0 and total_noop == 0:
+        logger.error(f"All {total_failures} writes failed with 0 success — "
+                     f"likely a permissions or configuration issue")
+        sys.exit(1)
+
 
 def _list_chunks(s3_bucket, prefix):
     keys = []
@@ -109,59 +118,89 @@ def _write_with_backoff(endpoint, index_name, v2_field, records):
     for sub_start in range(0, len(records), BULK_BATCH_SIZE):
         sub_records = records[sub_start:sub_start + BULK_BATCH_SIZE]
 
-        if backoff_delay > 0:
-            time.sleep(backoff_delay)
+        # Retry each sub-batch up to 3 times on failure
+        batch_written, batch_noop, batch_not_found, batch_failures = 0, 0, 0, 0
+        remaining = sub_records
 
-        bulk_lines = []
-        for rec in sub_records:
-            action = json.dumps({"update": {"_id": rec["doc_id"], "_index": index_name}})
-            script = json.dumps({
-                "script": {
-                    "source": (
-                        f"if (ctx._source.containsKey('{v2_field}') == false "
-                        f"|| ctx._source.{v2_field} == null) "
-                        f"{{ ctx._source.{v2_field} = params.vec }} "
-                        f"else {{ ctx.op = 'noop' }}"
-                    ),
-                    "lang": "painless",
-                    "params": {"vec": rec["embedding"]},
-                }
-            })
-            bulk_lines.append(action)
-            bulk_lines.append(script)
+        for attempt in range(3):
+            if not remaining:
+                break
 
-        bulk_body = "\n".join(bulk_lines) + "\n"
+            if backoff_delay > 0:
+                time.sleep(backoff_delay)
 
-        try:
-            bulk_resp = aoss_request(endpoint, "POST", "_bulk", bulk_body)
-        except RuntimeError as e:
-            # Entire bulk failed — increase backoff
-            failures += len(sub_records)
-            backoff_delay = min(backoff_delay + 2, 30)
-            logger.warning(f"Bulk failed ({len(sub_records)} docs), backoff={backoff_delay}s: {e}")
-            continue
+            bulk_lines = []
+            for rec in remaining:
+                action = json.dumps({"update": {"_id": rec["doc_id"], "_index": index_name}})
+                script = json.dumps({
+                    "script": {
+                        "source": (
+                            f"if (ctx._source.containsKey('{v2_field}') == false "
+                            f"|| ctx._source.{v2_field} == null) "
+                            f"{{ ctx._source.{v2_field} = params.vec }} "
+                            f"else {{ ctx.op = 'noop' }}"
+                        ),
+                        "lang": "painless",
+                        "params": {"vec": rec["embedding"]},
+                    }
+                })
+                bulk_lines.append(action)
+                bulk_lines.append(script)
 
-        # Parse per-item results
-        batch_failures = 0
-        for item in bulk_resp.get("items", []):
-            result = item.get("update", {})
-            status = result.get("status", 0)
-            if status == 200:
-                if result.get("result") == "noop":
-                    noop += 1
+            bulk_body_inner = "\n".join(bulk_lines) + "\n"
+
+            try:
+                bulk_resp = aoss_request(endpoint, "POST", "_bulk", bulk_body_inner)
+            except RuntimeError as e:
+                backoff_delay = min(backoff_delay + 5, 60)
+                if attempt < 2:
+                    logger.warning(f"Bulk failed (attempt {attempt+1}/3, {len(remaining)} docs), "
+                                   f"backoff={backoff_delay}s: {e}")
+                    continue
                 else:
-                    written += 1
-            elif status == 404:
-                not_found += 1
-            else:
-                failures += 1
-                batch_failures += 1
+                    batch_failures += len(remaining)
+                    logger.error(f"Bulk permanently failed ({len(remaining)} docs): {e}")
+                    break
 
-        # Adaptive backoff: increase on failures, decrease on success
-        if batch_failures > 0:
-            backoff_delay = min(backoff_delay + 1, 30)
-        else:
-            backoff_delay = max(backoff_delay - 0.5, 0)
+            # Parse results and collect failed records for retry
+            resp_items = bulk_resp.get("items", [])
+            if len(resp_items) != len(remaining):
+                logger.warning(f"Bulk response items ({len(resp_items)}) != sent records ({len(remaining)}). "
+                               f"Treating {len(remaining) - len(resp_items)} unmatched records as failures.")
+                batch_failures += max(0, len(remaining) - len(resp_items))
+
+            failed_in_batch = []
+            for idx, item in enumerate(resp_items):
+                result = item.get("update", {})
+                status = result.get("status", 0)
+                if status == 200:
+                    if result.get("result") == "noop":
+                        batch_noop += 1
+                    else:
+                        batch_written += 1
+                elif status == 404:
+                    batch_not_found += 1
+                elif status == 429:
+                    # Throttled — retry this record
+                    failed_in_batch.append(remaining[idx])
+                else:
+                    batch_failures += 1
+
+            remaining = failed_in_batch
+            if remaining:
+                backoff_delay = min(backoff_delay + 5, 60)
+                logger.warning(f"Batch attempt {attempt+1}: {len(remaining)} throttled, "
+                               f"retrying with backoff={backoff_delay}s")
+            else:
+                backoff_delay = max(backoff_delay - 1, 0)
+
+        # Any still-remaining records are permanent failures
+        batch_failures += len(remaining)
+
+        written += batch_written
+        noop += batch_noop
+        not_found += batch_not_found
+        failures += batch_failures
 
     return written, noop, not_found, failures
 

@@ -98,7 +98,7 @@ def main():
         (model_dir / "done.marker").write_text("no input")
         return
 
-    CHUNK_SIZE = 50000
+    CHUNK_SIZE = int(os.environ.get("SM_HP_CHUNK_SIZE", "50000"))
     total_written = 0
     chunk_num = 0
     chunk_lines = []
@@ -245,6 +245,7 @@ def handler(event, context):
             "sagemaker_submit_directory": script_s3_uri,
             "model_name": model_name,
             "batch_size": str(batch_size),
+            "chunk_size": str(event.get("chunk_size", 50000)),
             "s3_bucket": s3_bucket,
             "s3_prefix": s3_prefix,
         },

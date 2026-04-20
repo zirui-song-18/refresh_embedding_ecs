@@ -43,12 +43,11 @@ def handler(event, context):
         "total_count": total_count,
         "complete": missing_count == 0,
         "completion_pct": completion_pct,
-        # Pass through config
+        # Pass through config for Switch Lambda
         "collection_endpoint": endpoint,
         "index_name": index_name,
         "v2_field": v2_field,
         "text_field": event["text_field"],
-        "sagemaker_endpoint_name": event["sagemaker_endpoint_name"],
         "pipeline_name": event["pipeline_name"],
         "search_pipeline_name": event["search_pipeline_name"],
         "model_id": event["model_id"],
