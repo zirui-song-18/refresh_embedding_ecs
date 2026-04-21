@@ -14,6 +14,7 @@ import time
 
 import boto3
 from aoss_client import aoss_request
+from encryption import download_and_decrypt_from_metadata, is_encryption_enabled
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -50,10 +51,16 @@ def main():
     for i, chunk_key in enumerate(chunk_keys):
         logger.info(f"Processing chunk {i+1}/{len(chunk_keys)}: {chunk_key}")
 
-        # Read chunk from S3
-        obj = s3.get_object(Bucket=s3_bucket, Key=chunk_key)
+        # Read chunk from S3 (decrypt if encryption enabled)
+        if is_encryption_enabled():
+            plaintext = download_and_decrypt_from_metadata(s3, s3_bucket, chunk_key)
+            lines_raw = plaintext.decode("utf-8").splitlines()
+        else:
+            obj = s3.get_object(Bucket=s3_bucket, Key=chunk_key)
+            lines_raw = io.TextIOWrapper(obj["Body"], encoding="utf-8").readlines()
+
         records = []
-        for line in io.TextIOWrapper(obj["Body"], encoding="utf-8"):
+        for line in lines_raw:
             line = line.strip()
             if not line:
                 continue

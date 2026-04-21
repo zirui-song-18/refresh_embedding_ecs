@@ -91,7 +91,7 @@ def main():
                 "query": {
                     "knn": {
                         args.v2_field: {
-                            "vector": v2_vec[:384],
+                            "vector": v2_vec,
                             "k": 3,
                         }
                     }

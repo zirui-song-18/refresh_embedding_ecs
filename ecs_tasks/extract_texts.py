@@ -11,6 +11,7 @@ import time
 
 import boto3
 from aoss_client import aoss_request
+from encryption import encrypt_and_upload_with_nonce_prefix, is_encryption_enabled
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
@@ -141,8 +142,12 @@ def _cleanup_s3_prefix(s3_bucket, prefix):
 
 def _flush_chunk(s3_bucket, s3_prefix, chunk_num, lines):
     key = f"{s3_prefix}/texts/chunk_{chunk_num:06d}.jsonl"
-    body = "\n".join(lines) + "\n"
-    s3.put_object(Bucket=s3_bucket, Key=key, Body=body.encode("utf-8"))
+    body = ("\n".join(lines) + "\n").encode("utf-8")
+    if is_encryption_enabled():
+        # Prepend nonce to ciphertext (SageMaker input channel loses S3 metadata)
+        encrypt_and_upload_with_nonce_prefix(s3, s3_bucket, key, body)
+    else:
+        s3.put_object(Bucket=s3_bucket, Key=key, Body=body)
 
 
 if __name__ == "__main__":

@@ -21,6 +21,7 @@ s3 = boto3.client("s3")
 
 # Configurable via environment variables
 INSTANCE_TYPE = os.environ.get("EMBEDDING_INSTANCE_TYPE", "ml.g5.xlarge")
+INSTANCE_COUNT = int(os.environ.get("EMBEDDING_INSTANCE_COUNT", "8"))
 VOLUME_SIZE_GB = int(os.environ.get("EMBEDDING_VOLUME_SIZE_GB", "50"))
 
 # HuggingFace Training container — has transformers + torch pre-installed
@@ -40,11 +41,48 @@ from pathlib import Path
 import boto3
 import torch
 from transformers import AutoTokenizer, AutoModel
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 
+# --- Encryption helpers ---
+def _get_encryption_key():
+    key_str = os.environ.get("SM_HP_ENCRYPTION_KEY", "")
+    if not key_str:
+        return None
+    key_bytes = key_str.encode("utf-8")
+    if len(key_bytes) < 32:
+        key_bytes = key_bytes.ljust(32, b"\\0")
+    return key_bytes[:32]
+
+
+def decrypt_file(file_path, encryption_key):
+    """Decrypt an AES-GCM encrypted file. Nonce is first 12 bytes."""
+    with open(file_path, "rb") as f:
+        data = f.read()
+    # For SageMaker: files are downloaded from S3 via input channel.
+    # S3 metadata (nonce) is lost, so we prepend nonce to ciphertext during upload.
+    nonce = data[:12]
+    ciphertext = data[12:]
+    aesgcm = AESGCM(encryption_key)
+    return aesgcm.decrypt(nonce, ciphertext, None)
+
+
+def encrypt_and_upload(s3_client, bucket, key, plaintext, encryption_key):
+    """Encrypt with AES-GCM and upload. Nonce stored in S3 metadata."""
+    nonce = os.urandom(12)
+    aesgcm = AESGCM(encryption_key)
+    ciphertext = aesgcm.encrypt(nonce, plaintext, None)
+    s3_client.put_object(
+        Bucket=bucket, Key=key, Body=ciphertext,
+        Metadata={"encryption-nonce": nonce.hex()},
+    )
+    return key
+
+
+# --- Model helpers ---
 def mean_pooling(model_output, attention_mask):
     token_embeddings = model_output[0]
     input_mask_expanded = attention_mask.unsqueeze(-1).expand(token_embeddings.size()).float()
@@ -60,10 +98,14 @@ def encode_batch(model, tokenizer, texts, max_length, device):
     return embeddings.cpu().numpy()
 
 
-def upload_chunk_to_s3(s3_client, bucket, prefix, chunk_num, lines):
-    key = f"{prefix}/embeddings/chunk_{chunk_num:06d}.jsonl"
-    body = "\\n".join(lines) + "\\n"
-    s3_client.put_object(Bucket=bucket, Key=key, Body=body.encode("utf-8"))
+def upload_chunk_to_s3(s3_client, bucket, prefix, host_idx, chunk_num, lines, encryption_key):
+    """Upload embedding chunk, with optional encryption."""
+    key = f"{prefix}/embeddings/host{host_idx:02d}_chunk_{chunk_num:06d}.jsonl"
+    body = ("\\n".join(lines) + "\\n").encode("utf-8")
+    if encryption_key:
+        encrypt_and_upload(s3_client, bucket, key, body, encryption_key)
+    else:
+        s3_client.put_object(Bucket=bucket, Key=key, Body=body)
     return key
 
 
@@ -73,8 +115,22 @@ def main():
     model_name = os.environ.get("SM_HP_MODEL_NAME", "sentence-transformers/all-MiniLM-L6-v2")
     batch_size = int(os.environ.get("SM_HP_BATCH_SIZE", "256"))
     max_seq_length = int(os.environ.get("SM_HP_MAX_SEQ_LENGTH", "512"))
+    chunk_size = int(os.environ.get("SM_HP_CHUNK_SIZE", "50000"))
     s3_bucket = os.environ.get("SM_HP_S3_BUCKET", "")
     s3_prefix = os.environ.get("SM_HP_S3_PREFIX", "")
+
+    # Multi-instance: get host index for unique output naming
+    current_host = os.environ.get("SM_CURRENT_HOST", "algo-1")
+    host_idx = int(current_host.split("-")[1]) - 1
+    num_hosts = len(os.environ.get("SM_HOSTS", "[\\"algo-1\\"]").strip("[]").split(","))
+    logger.info(f"Host: {current_host} (index={host_idx}), total hosts: {num_hosts}")
+
+    # Encryption key (None = no encryption)
+    encryption_key = _get_encryption_key()
+    if encryption_key:
+        logger.info("Client-side encryption ENABLED")
+    else:
+        logger.info("Client-side encryption DISABLED")
 
     model_channel = Path(os.environ.get("SM_CHANNEL_MODEL", "/opt/ml/input/data/model"))
     if model_channel.exists() and any(model_channel.iterdir()):
@@ -98,59 +154,66 @@ def main():
         (model_dir / "done.marker").write_text("no input")
         return
 
-    CHUNK_SIZE = int(os.environ.get("SM_HP_CHUNK_SIZE", "50000"))
+    logger.info(f"Found {len(input_files)} input files (ShardedByS3Key assigned to this host)")
+
     total_written = 0
     chunk_num = 0
-    chunk_lines = []
     chunk_ids = []
     chunk_texts = []
     start_time = time.time()
 
     for input_file in input_files:
         logger.info(f"Reading {input_file}")
-        with open(input_file, "r", encoding="utf-8") as in_f:
-            for line in in_f:
-                line = line.strip()
-                if not line:
-                    continue
-                record = json.loads(line)
-                chunk_ids.append(record["doc_id"])
-                chunk_texts.append(record.get("text", ""))
 
-                if len(chunk_texts) >= CHUNK_SIZE:
-                    # Encode chunk
-                    emb_lines = _encode_chunk(model, tokenizer, chunk_ids, chunk_texts,
-                                              batch_size, max_seq_length, device)
-                    # Upload to S3
-                    key = upload_chunk_to_s3(s3_client, s3_bucket, s3_prefix, chunk_num, emb_lines)
+        # Decrypt if encryption enabled
+        if encryption_key:
+            plaintext = decrypt_file(input_file, encryption_key)
+            file_lines = plaintext.decode("utf-8").splitlines()
+        else:
+            with open(input_file, "r", encoding="utf-8") as in_f:
+                file_lines = in_f.readlines()
 
-                    total_written += len(chunk_texts)
-                    elapsed = time.time() - start_time
-                    rate = total_written / elapsed if elapsed > 0 else 0
-                    logger.info(f"Chunk {chunk_num}: {len(chunk_texts)} docs -> s3://{s3_bucket}/{key} | "
-                                f"Total: {total_written} | {rate:.0f} docs/sec")
+        for line in file_lines:
+            line = line.strip()
+            if not line:
+                continue
+            record = json.loads(line)
+            chunk_ids.append(record["doc_id"])
+            chunk_texts.append(record.get("text", ""))
 
-                    chunk_num += 1
-                    chunk_ids = []
-                    chunk_texts = []
+            if len(chunk_texts) >= chunk_size:
+                emb_lines = _encode_chunk(model, tokenizer, chunk_ids, chunk_texts,
+                                          batch_size, max_seq_length, device)
+                key = upload_chunk_to_s3(s3_client, s3_bucket, s3_prefix, host_idx,
+                                         chunk_num, emb_lines, encryption_key)
+
+                total_written += len(chunk_texts)
+                elapsed = time.time() - start_time
+                rate = total_written / elapsed if elapsed > 0 else 0
+                logger.info(f"Chunk {chunk_num}: {len(chunk_texts)} docs -> s3://{s3_bucket}/{key} | "
+                            f"Total: {total_written} | {rate:.0f} docs/sec")
+
+                chunk_num += 1
+                chunk_ids = []
+                chunk_texts = []
 
     # Final partial chunk
     if chunk_texts:
         emb_lines = _encode_chunk(model, tokenizer, chunk_ids, chunk_texts,
                                   batch_size, max_seq_length, device)
-        key = upload_chunk_to_s3(s3_client, s3_bucket, s3_prefix, chunk_num, emb_lines)
+        key = upload_chunk_to_s3(s3_client, s3_bucket, s3_prefix, host_idx,
+                                 chunk_num, emb_lines, encryption_key)
         total_written += len(chunk_texts)
         chunk_num += 1
         logger.info(f"Final chunk: {len(chunk_texts)} docs -> s3://{s3_bucket}/{key}")
 
     elapsed = time.time() - start_time
-    logger.info(f"Done. {total_written} embeddings in {chunk_num} chunks, "
-                f"{elapsed:.0f}s ({total_written/elapsed:.0f} docs/sec)")
+    logger.info(f"Done. Host {current_host}: {total_written} embeddings in {chunk_num} chunks, "
+                f"{elapsed:.0f}s ({total_written/max(elapsed,1):.0f} docs/sec)")
 
-    # Write marker file so SageMaker considers the job successful
-    # (model.tar.gz will be tiny — just this marker)
     (model_dir / "done.marker").write_text(
-        json.dumps({"total_written": total_written, "chunks": chunk_num, "elapsed_seconds": int(elapsed)})
+        json.dumps({"host": current_host, "total_written": total_written,
+                    "chunks": chunk_num, "elapsed_seconds": int(elapsed)})
     )
 
 
@@ -223,7 +286,7 @@ def handler(event, context):
                     "S3DataSource": {
                         "S3DataType": "S3Prefix",
                         "S3Uri": input_s3_uri,
-                        "S3DataDistributionType": "FullyReplicated",
+                        "S3DataDistributionType": "ShardedByS3Key",
                     }
                 },
                 "ContentType": "application/jsonlines",
@@ -234,7 +297,7 @@ def handler(event, context):
         },
         ResourceConfig={
             "InstanceType": INSTANCE_TYPE,
-            "InstanceCount": 1,
+            "InstanceCount": INSTANCE_COUNT,
             "VolumeSizeInGB": VOLUME_SIZE_GB,
         },
         StoppingCondition={
@@ -248,6 +311,7 @@ def handler(event, context):
             "chunk_size": str(event.get("chunk_size", 50000)),
             "s3_bucket": s3_bucket,
             "s3_prefix": s3_prefix,
+            "encryption_key": os.environ.get("ENCRYPTION_KEY", ""),
         },
     )
 

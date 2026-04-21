@@ -26,6 +26,9 @@ Globals:
     Runtime: python3.12
     Timeout: 900
     MemorySize: 512
+    Environment:
+      Variables:
+        ENCRYPTION_KEY: "shanghaiopensearchFINETUNETASK"
 
 Resources:
   # ---- S3 Bucket ----

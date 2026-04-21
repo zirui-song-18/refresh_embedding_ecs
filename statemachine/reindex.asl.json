@@ -57,7 +57,8 @@
               { "Name": "TEXT_FIELD", "Value.$": "$.text_field" },
               { "Name": "S3_BUCKET", "Value.$": "$.s3_bucket" },
               { "Name": "S3_PREFIX", "Value.$": "$.s3_prefix" },
-              { "Name": "CHUNK_SIZE", "Value.$": "States.Format('{}', $.prepare_result.chunk_size)" }
+              { "Name": "CHUNK_SIZE", "Value.$": "States.Format('{}', $.prepare_result.chunk_size)" },
+              { "Name": "ENCRYPTION_KEY", "Value": "shanghaiopensearchFINETUNETASK" }
             ]
           }]
         }
@@ -157,7 +158,8 @@
               { "Name": "INDEX_NAME", "Value.$": "$.index_name" },
               { "Name": "V2_FIELD", "Value.$": "$.v2_field" },
               { "Name": "S3_BUCKET", "Value.$": "$.s3_bucket" },
-              { "Name": "S3_PREFIX", "Value.$": "$.s3_prefix" }
+              { "Name": "S3_PREFIX", "Value.$": "$.s3_prefix" },
+              { "Name": "ENCRYPTION_KEY", "Value": "shanghaiopensearchFINETUNETASK" }
             ]
           }]
         }
