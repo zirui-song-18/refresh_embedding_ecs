@@ -12,6 +12,9 @@ if __name__ == "__main__":
     elif task_type == "write_embeddings":
         from write_embeddings import main
         main()
+    elif task_type == "clean_old_field":
+        from clean_old_field import main
+        main()
     else:
-        print(f"Unknown TASK_TYPE: '{task_type}'. Must be 'extract_texts' or 'write_embeddings'.")
+        print(f"Unknown TASK_TYPE: '{task_type}'. Must be 'extract_texts', 'write_embeddings', or 'clean_old_field'.")
         sys.exit(1)
