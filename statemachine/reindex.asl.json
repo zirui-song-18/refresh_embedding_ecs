@@ -93,7 +93,7 @@
         "chunk_size.$": "$.prepare_result.chunk_size"
       },
       "ResultPath": "$.job_result",
-      "Next": "WaitForEmbeddingJob",
+      "Next": "IsJobSkipped",
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
@@ -102,6 +102,15 @@
         }
       ],
       "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }]
+    },
+
+    "IsJobSkipped": {
+      "Type": "Choice",
+      "Comment": "If ExtractTexts found 0 docs, StartEmbeddingJob returns skipped=true. Skip SageMaker + WriteEmbeddings.",
+      "Choices": [
+        { "Variable": "$.job_result.skipped", "BooleanEquals": true, "Next": "WaitForRefresh" }
+      ],
+      "Default": "WaitForEmbeddingJob"
     },
 
     "WaitForEmbeddingJob": {

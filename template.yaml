@@ -177,6 +177,9 @@ Resources:
               Action: [s3:PutObject, s3:GetObject]
               Resource: !Sub "${EmbeddingDataBucket.Arn}/*"
             - Effect: Allow
+              Action: s3:ListBucket
+              Resource: !GetAtt EmbeddingDataBucket.Arn
+            - Effect: Allow
               Action: iam:PassRole
               Resource: !GetAtt SageMakerExecutionRole.Arn
 

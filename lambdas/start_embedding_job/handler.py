@@ -256,6 +256,32 @@ def handler(event, context):
     model_name = event.get("embedding_model_name", "sentence-transformers/all-MiniLM-L6-v2")
     batch_size = event.get("embedding_batch_size", 256)
 
+    # Check if there are any text chunks to process
+    texts_prefix = f"{s3_prefix}/texts/"
+    paginator = s3.get_paginator("list_objects_v2")
+    has_input = False
+    for page in paginator.paginate(Bucket=s3_bucket, Prefix=texts_prefix, MaxKeys=1):
+        if page.get("Contents"):
+            has_input = True
+            break
+
+    if not has_input:
+        logger.info("No text chunks found in S3 — all docs may already have v2. Skipping SageMaker job.")
+        return {
+            "job_name": "SKIPPED",
+            "skipped": True,
+            "s3_bucket": s3_bucket,
+            "s3_prefix": s3_prefix,
+            "collection_endpoint": event["collection_endpoint"],
+            "index_name": event["index_name"],
+            "v2_field": event["v2_field"],
+            "text_field": event["text_field"],
+            "pipeline_name": event["pipeline_name"],
+            "search_pipeline_name": event["search_pipeline_name"],
+            "model_id": event["model_id"],
+            "v1_field": event["v1_field"],
+        }
+
     # Upload training script to S3
     script_s3_uri = _upload_training_script(s3_bucket, s3_prefix)
 
