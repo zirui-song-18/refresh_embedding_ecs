@@ -345,6 +345,7 @@ def handler(event, context):
 
     return {
         "job_name": job_name,
+        "skipped": False,
         "s3_bucket": s3_bucket,
         "s3_prefix": s3_prefix,
         "output_s3_uri": output_s3_uri,

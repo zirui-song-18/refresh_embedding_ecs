@@ -1,7 +1,8 @@
 """ECS Task: Set old embedding field to null on all documents to reclaim storage.
 
-Runs after Switch — the old field is no longer used for queries or ingestion.
-Uses PIT + search_after to paginate, bulk update to null.
+Streams per-chunk (same pattern as WriteEmbeddings):
+  PIT search → accumulate doc_ids → when chunk full → parallel write → free → continue
+Peak memory = one chunk of batch items (~350 bytes × 50K = ~17MB).
 """
 
 import json
@@ -9,24 +10,26 @@ import logging
 import os
 import time
 
-import boto3
 from aoss_client import aoss_request
+from bulk_writer import parallel_bulk_write
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
 SEARCH_PAGE_SIZE = 10000
-BULK_BATCH_SIZE = 1000  # larger than WriteEmbeddings since payload is tiny
+BULK_BATCH_SIZE = 1000
+CHUNK_SIZE = 50000  # flush and write after collecting this many doc_ids
 
 
 def main():
     endpoint = os.environ["COLLECTION_ENDPOINT"]
     index_name = os.environ["INDEX_NAME"]
     old_field = os.environ["OLD_FIELD"]
+    concurrency = int(os.environ.get("WRITE_CONCURRENCY", "1"))
 
-    logger.info(f"CleanOldField starting: index={index_name}, old_field={old_field}")
+    logger.info(f"CleanOldField starting: index={index_name}, old_field={old_field}, "
+                f"concurrency={concurrency}")
 
-    # Count docs that still have the old field (non-null)
     count_resp = aoss_request(endpoint, "POST", f"{index_name}/_count", {
         "query": {"exists": {"field": old_field}}
     })
@@ -45,15 +48,15 @@ def main():
     pit_id = pit_resp["pit_id"]
     logger.info("PIT created")
 
-    total_cleaned = 0
+    total_success = 0
     total_failures = 0
+    chunk_num = 0
+    current_chunk = []  # accumulates batch items until CHUNK_SIZE
     search_after = None
     start_time = time.time()
-    backoff_delay = 0.0
 
     try:
         while True:
-            # Search for docs that have the old field
             search_body = {
                 "size": SEARCH_PAGE_SIZE,
                 "_source": False,
@@ -70,61 +73,37 @@ def main():
             if not hits:
                 break
 
-            # Build bulk request to null out the old field
-            doc_ids = [hit["_id"] for hit in hits]
+            # Build batch items from this page
+            for hit in hits:
+                action = json.dumps({"update": {"_id": hit["_id"], "_index": index_name}})
+                body = json.dumps({
+                    "script": {
+                        "source": f"ctx._source.{old_field} = null",
+                        "lang": "painless",
+                    }
+                })
+                current_chunk.append({"action": action, "body": body})
 
-            for batch_start in range(0, len(doc_ids), BULK_BATCH_SIZE):
-                batch_ids = doc_ids[batch_start:batch_start + BULK_BATCH_SIZE]
+                # Flush chunk when full
+                if len(current_chunk) >= CHUNK_SIZE:
+                    s, f = _flush_chunk(endpoint, current_chunk, concurrency, chunk_num)
+                    total_success += s
+                    total_failures += f
+                    chunk_num += 1
+                    current_chunk = []
 
-                if backoff_delay > 0:
-                    time.sleep(backoff_delay)
-
-                bulk_lines = []
-                for doc_id in batch_ids:
-                    action = json.dumps({"update": {"_id": doc_id, "_index": index_name}})
-                    script = json.dumps({
-                        "script": {
-                            "source": f"ctx._source.{old_field} = null",
-                            "lang": "painless",
-                        }
-                    })
-                    bulk_lines.append(action)
-                    bulk_lines.append(script)
-
-                bulk_body = "\n".join(bulk_lines) + "\n"
-
-                try:
-                    bulk_resp = aoss_request(endpoint, "POST", "_bulk", bulk_body)
-                except RuntimeError as e:
-                    total_failures += len(batch_ids)
-                    backoff_delay = min(backoff_delay + 5, 60)
-                    logger.warning(f"Bulk failed ({len(batch_ids)} docs), backoff={backoff_delay}s: {e}")
-                    continue
-
-                # Count results
-                batch_failures = 0
-                for item in bulk_resp.get("items", []):
-                    result = item.get("update", {})
-                    status = result.get("status", 0)
-                    if status == 200:
-                        total_cleaned += 1
-                    elif status == 429:
-                        batch_failures += 1
-                    else:
-                        total_failures += 1
-
-                if batch_failures > 0:
-                    total_failures += batch_failures
-                    backoff_delay = min(backoff_delay + 2, 60)
-                else:
-                    backoff_delay = max(backoff_delay - 1, 0)
+                    elapsed = time.time() - start_time
+                    rate = total_success / elapsed if elapsed > 0 else 0
+                    logger.info(f"Cleaned {total_success:,}/{total_to_clean:,} docs, "
+                                f"{rate:.0f} docs/sec, failures={total_failures}")
 
             search_after = hits[-1]["sort"]
 
-            elapsed = time.time() - start_time
-            rate = total_cleaned / elapsed if elapsed > 0 else 0
-            logger.info(f"Cleaned {total_cleaned:,}/{total_to_clean:,} docs, "
-                        f"{rate:.0f} docs/sec, failures={total_failures}")
+        # Flush remaining
+        if current_chunk:
+            s, f = _flush_chunk(endpoint, current_chunk, concurrency, chunk_num)
+            total_success += s
+            total_failures += f
 
     finally:
         try:
@@ -134,9 +113,20 @@ def main():
             logger.warning(f"Failed to delete PIT: {e}")
 
     elapsed = time.time() - start_time
-    logger.info(f"CleanOldField complete: cleaned={total_cleaned:,}, "
-                f"failures={total_failures:,}, time={elapsed:.0f}s "
-                f"({total_cleaned / max(elapsed, 1):.0f} docs/sec)")
+    logger.info(f"CleanOldField complete: cleaned={total_success:,}, failures={total_failures:,}, "
+                f"time={elapsed:.0f}s ({total_success / max(elapsed, 1):.0f} docs/sec)")
+
+
+def _flush_chunk(endpoint, chunk_items, concurrency, chunk_num):
+    """Split chunk items into batches and parallel write."""
+    batches = []
+    for i in range(0, len(chunk_items), BULK_BATCH_SIZE):
+        batches.append(chunk_items[i:i + BULK_BATCH_SIZE])
+
+    return parallel_bulk_write(
+        endpoint, batches, concurrency,
+        task_label=f"CleanOldField[chunk {chunk_num}]"
+    )
 
 
 if __name__ == "__main__":

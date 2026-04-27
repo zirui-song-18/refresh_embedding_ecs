@@ -1,7 +1,13 @@
-"""AOSS client with SigV4 signing, timeout, retry, and credential refresh."""
+"""AOSS client with SigV4 signing, timeout, retry, and credential refresh.
+
+Thread-safe: uses per-thread HTTP sessions to avoid request corruption
+when called from multiple threads via bulk_writer.parallel_bulk_write.
+"""
 
 import json
 import logging
+import threading
+
 import boto3
 import requests
 from requests.adapters import HTTPAdapter
@@ -14,12 +20,20 @@ _session = boto3.Session()
 _retry_strategy = Retry(
     total=5,
     backoff_factor=2,
-    status_forcelist=[429, 500, 502, 503],
+    status_forcelist=[429, 500, 502, 503, 504],
     allowed_methods=["GET", "POST", "PUT", "DELETE"],
     raise_on_status=False,
 )
-_http_session = requests.Session()
-_http_session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
+_thread_local = threading.local()
+
+
+def _get_http_session():
+    """Get or create a per-thread HTTP session."""
+    if not hasattr(_thread_local, "http_session"):
+        session = requests.Session()
+        session.mount("https://", HTTPAdapter(max_retries=_retry_strategy))
+        _thread_local.http_session = session
+    return _thread_local.http_session
 
 
 def _get_auth():
@@ -42,7 +56,8 @@ def aoss_request(endpoint, method, path, body=None):
     else:
         data = None
 
-    resp = _http_session.request(
+    http_session = _get_http_session()
+    resp = http_session.request(
         method, url, auth=_get_auth(), headers=headers, data=data,
         timeout=(5, 120),
     )

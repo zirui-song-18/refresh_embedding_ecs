@@ -1,5 +1,5 @@
 {
-  "Comment": "Dual-field reindex: ECS for heavy tasks, Lambda for light tasks, with retry loop for 100% completion",
+  "Comment": "Dual-field reindex: ECS for heavy tasks, Lambda for light tasks, with retry loops for 100% completion",
   "StartAt": "Prepare",
   "States": {
     "Prepare": {
@@ -98,7 +98,7 @@
         {
           "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
           "IntervalSeconds": 60, "MaxAttempts": 10, "BackoffRate": 2.0,
-          "Comment": "SageMaker quota may be temporarily exhausted — retry up to 10 times with exponential backoff (60s, 120s, 240s, ...)"
+          "Comment": "SageMaker quota may be temporarily exhausted — retry up to 10 times with exponential backoff"
         }
       ],
       "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }]
@@ -106,7 +106,7 @@
 
     "IsJobSkipped": {
       "Type": "Choice",
-      "Comment": "If ExtractTexts found 0 docs, StartEmbeddingJob returns skipped=true. Skip SageMaker + WriteEmbeddings.",
+      "Comment": "If ExtractTexts found 0 docs, StartEmbeddingJob returns skipped=true.",
       "Choices": [
         { "Variable": "$.job_result.skipped", "BooleanEquals": true, "Next": "WaitForRefresh" }
       ],
@@ -169,7 +169,8 @@
               { "Name": "V2_FIELD", "Value.$": "$.v2_field" },
               { "Name": "S3_BUCKET", "Value.$": "$.s3_bucket" },
               { "Name": "S3_PREFIX", "Value.$": "$.s3_prefix" },
-              { "Name": "ENCRYPTION_KEY", "Value": "shanghaiopensearchFINETUNETASK" }
+              { "Name": "ENCRYPTION_KEY", "Value": "shanghaiopensearchFINETUNETASK" },
+              { "Name": "WRITE_CONCURRENCY", "Value.$": "States.Format('{}', $.prepare_result.write_concurrency)" }
             ]
           }]
         }
@@ -251,7 +252,7 @@
       "Resource": "${SwitchFunctionArn}",
       "InputPath": "$.check_result",
       "ResultPath": "$.switch_result",
-      "Next": "CleanOldField",
+      "Next": "InitCleanRetryState",
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
@@ -259,6 +260,13 @@
         }
       ],
       "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }]
+    },
+
+    "InitCleanRetryState": {
+      "Type": "Pass",
+      "Result": { "clean_retry_count": 0 },
+      "ResultPath": "$.clean_retry_state",
+      "Next": "CleanOldField"
     },
 
     "CleanOldField": {
@@ -284,20 +292,77 @@
               { "Name": "TASK_TYPE", "Value": "clean_old_field" },
               { "Name": "COLLECTION_ENDPOINT", "Value.$": "$.collection_endpoint" },
               { "Name": "INDEX_NAME", "Value.$": "$.index_name" },
-              { "Name": "OLD_FIELD", "Value.$": "$.v1_field" }
+              { "Name": "OLD_FIELD", "Value.$": "$.v1_field" },
+              { "Name": "WRITE_CONCURRENCY", "Value.$": "States.Format('{}', $.prepare_result.write_concurrency)" }
             ]
           }]
         }
       },
       "ResultPath": "$.clean_result",
-      "End": true,
+      "Next": "WaitForCleanRefresh",
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed", "ECS.AmazonECSException"],
           "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2.0
         }
       ],
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }]
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CleanDone" }]
+    },
+
+    "WaitForCleanRefresh": {
+      "Type": "Wait",
+      "Seconds": 65,
+      "Next": "CleanCompletenessCheck"
+    },
+
+    "CleanCompletenessCheck": {
+      "Type": "Task",
+      "Resource": "${CompletenessCheckFunctionArn}",
+      "Parameters": {
+        "collection_endpoint.$": "$.collection_endpoint",
+        "index_name.$": "$.index_name",
+        "check_mode": "clean_complete",
+        "check_field.$": "$.v1_field"
+      },
+      "ResultPath": "$.clean_check_result",
+      "Next": "IsCleanComplete",
+      "Retry": [
+        {
+          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
+          "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CleanDone" }]
+    },
+
+    "IsCleanComplete": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.clean_check_result.complete", "BooleanEquals": true, "Next": "CleanDone" }
+      ],
+      "Default": "IncrementCleanRetryCount"
+    },
+
+    "IncrementCleanRetryCount": {
+      "Type": "Pass",
+      "Parameters": {
+        "clean_retry_count.$": "States.MathAdd($.clean_retry_state.clean_retry_count, 1)"
+      },
+      "ResultPath": "$.clean_retry_state",
+      "Next": "CheckCleanRetryLimit"
+    },
+
+    "CheckCleanRetryLimit": {
+      "Type": "Choice",
+      "Choices": [
+        { "Variable": "$.clean_retry_state.clean_retry_count", "NumericGreaterThanEquals": 3, "Next": "CleanDone" }
+      ],
+      "Default": "CleanOldField"
+    },
+
+    "CleanDone": {
+      "Type": "Succeed",
+      "Comment": "Workflow complete. Clean may not be 100% but search is already on v2."
     },
 
     "Failed": {

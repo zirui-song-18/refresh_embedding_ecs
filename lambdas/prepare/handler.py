@@ -96,7 +96,10 @@ def handler(event, context):
         ecs_cpu, ecs_memory, chunk_size = "8192", "61440", 10000
         tier = "large"
 
-    logger.info(f"Tier: {tier} — ECS config: {ecs_cpu} CPU, {ecs_memory} MB, chunk_size={chunk_size}")
+    write_concurrency = int(ecs_cpu) // 1024  # 1 thread per vCPU
+
+    logger.info(f"Tier: {tier} — ECS config: {ecs_cpu} CPU, {ecs_memory} MB, "
+                f"chunk_size={chunk_size}, write_concurrency={write_concurrency}")
 
     return {
         "status": "prepared",
@@ -107,5 +110,6 @@ def handler(event, context):
         "ecs_cpu": ecs_cpu,
         "ecs_memory": ecs_memory,
         "chunk_size": chunk_size,
+        "write_concurrency": write_concurrency,
         "tier": tier,
     }
