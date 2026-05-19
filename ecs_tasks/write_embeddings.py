@@ -1,7 +1,10 @@
 """ECS Task: Read embeddings from S3 chunks, write to AOSS via _bulk + Painless.
 
-Streams per-chunk: read one S3 chunk → build batches → parallel write → next chunk.
-Peak memory = one chunk (~1.7GB for 50K records with 768-dim embeddings).
+Per-chunk 100% guarantee: retries failed docs within each chunk until all
+succeed or max retries exhausted. No outer completeness loop needed.
+
+Streams per-chunk: read one S3 chunk → build batches → parallel write → retry
+failed → next chunk. Peak memory = one chunk.
 """
 
 import io
@@ -12,6 +15,7 @@ import sys
 import time
 
 import boto3
+from backoff import AdaptiveBackoff
 from bulk_writer import parallel_bulk_write
 from encryption import download_and_decrypt_from_metadata, is_encryption_enabled
 
@@ -20,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 s3 = boto3.client("s3")
 BULK_BATCH_SIZE = 500
+_MAX_CHUNK_RETRIES = 10
 
 
 def main():
@@ -45,25 +50,55 @@ def main():
     total_failures = 0
     start_time = time.time()
 
-    # Stream per-chunk: read → build batches → parallel write → free → next chunk
     for i, chunk_key in enumerate(chunk_keys):
         records = _read_chunk(s3_bucket, chunk_key)
-        batches = _build_update_batches(records, index_name, v2_field)
-        del records  # free memory before writing
+        records_by_id = {rec["doc_id"]: rec for rec in records}
 
-        s, f = parallel_bulk_write(
-            endpoint, batches, concurrency,
-            task_label=f"WriteEmbeddings[{i + 1}/{len(chunk_keys)}]"
-        )
-        total_success += s
-        total_failures += f
-        del batches  # free memory
+        # Per-chunk guarantee: retry until all records in this chunk succeed
+        remaining_records = records
+        chunk_retry = 0
+        chunk_backoff = AdaptiveBackoff(initial=5.0, max_delay=120.0)
+
+        while remaining_records:
+            batches = _build_update_batches(remaining_records, index_name, v2_field)
+            success, failed_items = parallel_bulk_write(
+                endpoint, batches, concurrency,
+                task_label=f"WriteEmbeddings[{i + 1}/{len(chunk_keys)}]"
+            )
+            total_success += success
+
+            # Extract doc_ids from failed items to retry with original records
+            failed_ids = set()
+            for item in failed_items:
+                action = json.loads(item["action"])
+                failed_ids.add(action["update"]["_id"])
+
+            remaining_records = [records_by_id[did] for did in failed_ids if did in records_by_id]
+
+            if remaining_records:
+                chunk_retry += 1
+                if chunk_retry >= _MAX_CHUNK_RETRIES:
+                    logger.error(
+                        f"Chunk {i + 1}: {len(remaining_records)} docs failed after "
+                        f"{_MAX_CHUNK_RETRIES} chunk retries — giving up"
+                    )
+                    total_failures += len(remaining_records)
+                    remaining_records = []
+                else:
+                    logger.warning(
+                        f"Chunk {i + 1}: {len(remaining_records)} docs need chunk-level retry "
+                        f"(round {chunk_retry}/{_MAX_CHUNK_RETRIES})"
+                    )
+                    chunk_backoff.on_failure()
+                    chunk_backoff.wait()
+
+        del records, records_by_id  # free memory
 
         elapsed = time.time() - start_time
         rate = total_success / elapsed if elapsed > 0 else 0
-        logger.info(f"Chunk {i + 1}/{len(chunk_keys)} done | "
+        logger.info(f"Chunk {i + 1}/{len(chunk_keys)} complete | "
                     f"Total: success={total_success:,}, failures={total_failures}, "
-                    f"{rate:.0f} docs/sec")
+                    f"retries={chunk_retry}, {rate:.0f} docs/sec")
 
     elapsed = time.time() - start_time
     logger.info(f"WriteEmbeddings complete: success={total_success:,}, failures={total_failures:,}, "
@@ -99,12 +134,23 @@ def _read_chunk(s3_bucket, chunk_key):
         line = line.strip()
         if not line:
             continue
-        records.append(json.loads(line))
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            logger.warning(f"Skipping non-JSON line: {line[:100]}")
+            continue
+        if "doc_id" not in rec or "embedding" not in rec:
+            logger.warning(f"Skipping malformed record: {line[:100]}")
+            continue
+        records.append(rec)
     return records
 
 
 def _build_update_batches(records, index_name, v2_field):
-    """Convert records into batches for parallel_bulk_write."""
+    """Convert records into batches for parallel_bulk_write.
+
+    Uses params.field with [] notation to prevent Painless injection.
+    """
     batches = []
     current_batch = []
 
@@ -113,13 +159,13 @@ def _build_update_batches(records, index_name, v2_field):
         body = json.dumps({
             "script": {
                 "source": (
-                    f"if (ctx._source.containsKey('{v2_field}') == false "
-                    f"|| ctx._source.{v2_field} == null) "
-                    f"{{ ctx._source.{v2_field} = params.vec }} "
-                    f"else {{ ctx.op = 'noop' }}"
+                    "if (ctx._source.containsKey(params.field) == false "
+                    "|| ctx._source[params.field] == null) "
+                    "{ ctx._source[params.field] = params.vec } "
+                    "else { ctx.op = 'noop' }"
                 ),
                 "lang": "painless",
-                "params": {"vec": rec["embedding"]},
+                "params": {"vec": rec["embedding"], "field": v2_field},
             }
         })
         current_batch.append({"action": action, "body": body})

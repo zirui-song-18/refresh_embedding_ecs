@@ -1,12 +1,12 @@
 {
-  "Comment": "Dual-field reindex: ECS for heavy tasks, Lambda for light tasks, with retry loops for 100% completion",
+  "Comment": "Dual-field reindex: ECS for heavy tasks, Lambda for light tasks. Per-chunk guarantee eliminates outer retry loop.",
   "StartAt": "Prepare",
   "States": {
     "Prepare": {
       "Type": "Task",
       "Resource": "${PrepareFunctionArn}",
       "ResultPath": "$.prepare_result",
-      "Next": "InitRetryState",
+      "Next": "WaitBeforeExtract",
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
@@ -14,13 +14,6 @@
         }
       ],
       "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }]
-    },
-
-    "InitRetryState": {
-      "Type": "Pass",
-      "Result": { "retry_count": 0 },
-      "ResultPath": "$.retry_state",
-      "Next": "WaitBeforeExtract"
     },
 
     "WaitBeforeExtract": {
@@ -108,7 +101,7 @@
       "Type": "Choice",
       "Comment": "If ExtractTexts found 0 docs, StartEmbeddingJob returns skipped=true.",
       "Choices": [
-        { "Variable": "$.job_result.skipped", "BooleanEquals": true, "Next": "WaitForRefresh" }
+        { "Variable": "$.job_result.skipped", "BooleanEquals": true, "Next": "Switch" }
       ],
       "Default": "WaitForEmbeddingJob"
     },
@@ -176,7 +169,7 @@
         }
       },
       "ResultPath": "$.write_ecs_result",
-      "Next": "WaitForRefresh",
+      "Next": "WaitBeforeSwitch",
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed", "ECS.AmazonECSException"],
@@ -186,15 +179,16 @@
       "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }]
     },
 
-    "WaitForRefresh": {
+    "WaitBeforeSwitch": {
       "Type": "Wait",
       "Seconds": 65,
-      "Next": "CompletenessCheck"
+      "Comment": "Wait for AOSS refresh cycle so all written embeddings are searchable",
+      "Next": "Switch"
     },
 
-    "CompletenessCheck": {
+    "Switch": {
       "Type": "Task",
-      "Resource": "${CompletenessCheckFunctionArn}",
+      "Resource": "${SwitchFunctionArn}",
       "Parameters": {
         "collection_endpoint.$": "$.collection_endpoint",
         "index_name.$": "$.index_name",
@@ -202,57 +196,10 @@
         "text_field.$": "$.text_field",
         "pipeline_name.$": "$.pipeline_name",
         "search_pipeline_name.$": "$.search_pipeline_name",
-        "model_id.$": "$.model_id",
-        "v1_field.$": "$.v1_field"
+        "model_id.$": "$.model_id"
       },
-      "ResultPath": "$.check_result",
-      "Next": "IsComplete",
-      "Retry": [
-        {
-          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
-          "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0
-        }
-      ],
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }]
-    },
-
-    "IsComplete": {
-      "Type": "Choice",
-      "Choices": [
-        { "Variable": "$.check_result.complete", "BooleanEquals": true, "Next": "Switch" }
-      ],
-      "Default": "IncrementRetryCount"
-    },
-
-    "IncrementRetryCount": {
-      "Type": "Pass",
-      "Parameters": {
-        "retry_count.$": "States.MathAdd($.retry_state.retry_count, 1)"
-      },
-      "ResultPath": "$.retry_state",
-      "Next": "CheckRetryLimit"
-    },
-
-    "CheckRetryLimit": {
-      "Type": "Choice",
-      "Choices": [
-        { "Variable": "$.retry_state.retry_count", "NumericGreaterThanEquals": 5, "Next": "RetryExhausted" }
-      ],
-      "Default": "WaitBeforeExtract"
-    },
-
-    "RetryExhausted": {
-      "Type": "Fail",
-      "Cause": "Reindex incomplete after 5 retry rounds. Not all documents have v2 embeddings.",
-      "Error": "RetryExhaustedError"
-    },
-
-    "Switch": {
-      "Type": "Task",
-      "Resource": "${SwitchFunctionArn}",
-      "InputPath": "$.check_result",
       "ResultPath": "$.switch_result",
-      "Next": "InitCleanRetryState",
+      "Next": "CleanOldField",
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
@@ -260,13 +207,6 @@
         }
       ],
       "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Failed" }]
-    },
-
-    "InitCleanRetryState": {
-      "Type": "Pass",
-      "Result": { "clean_retry_count": 0 },
-      "ResultPath": "$.clean_retry_state",
-      "Next": "CleanOldField"
     },
 
     "CleanOldField": {
@@ -299,70 +239,19 @@
         }
       },
       "ResultPath": "$.clean_result",
-      "Next": "WaitForCleanRefresh",
+      "Next": "Done",
       "Retry": [
         {
           "ErrorEquals": ["States.TaskFailed", "ECS.AmazonECSException"],
           "IntervalSeconds": 30, "MaxAttempts": 2, "BackoffRate": 2.0
         }
       ],
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CleanDone" }]
+      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "Done" }]
     },
 
-    "WaitForCleanRefresh": {
-      "Type": "Wait",
-      "Seconds": 65,
-      "Next": "CleanCompletenessCheck"
-    },
-
-    "CleanCompletenessCheck": {
-      "Type": "Task",
-      "Resource": "${CompletenessCheckFunctionArn}",
-      "Parameters": {
-        "collection_endpoint.$": "$.collection_endpoint",
-        "index_name.$": "$.index_name",
-        "check_mode": "clean_complete",
-        "check_field.$": "$.v1_field"
-      },
-      "ResultPath": "$.clean_check_result",
-      "Next": "IsCleanComplete",
-      "Retry": [
-        {
-          "ErrorEquals": ["States.TaskFailed", "Lambda.ServiceException", "Lambda.TooManyRequestsException", "Lambda.SdkClientException"],
-          "IntervalSeconds": 5, "MaxAttempts": 3, "BackoffRate": 2.0
-        }
-      ],
-      "Catch": [{ "ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "CleanDone" }]
-    },
-
-    "IsCleanComplete": {
-      "Type": "Choice",
-      "Choices": [
-        { "Variable": "$.clean_check_result.complete", "BooleanEquals": true, "Next": "CleanDone" }
-      ],
-      "Default": "IncrementCleanRetryCount"
-    },
-
-    "IncrementCleanRetryCount": {
-      "Type": "Pass",
-      "Parameters": {
-        "clean_retry_count.$": "States.MathAdd($.clean_retry_state.clean_retry_count, 1)"
-      },
-      "ResultPath": "$.clean_retry_state",
-      "Next": "CheckCleanRetryLimit"
-    },
-
-    "CheckCleanRetryLimit": {
-      "Type": "Choice",
-      "Choices": [
-        { "Variable": "$.clean_retry_state.clean_retry_count", "NumericGreaterThanEquals": 3, "Next": "CleanDone" }
-      ],
-      "Default": "CleanOldField"
-    },
-
-    "CleanDone": {
+    "Done": {
       "Type": "Succeed",
-      "Comment": "Workflow complete. Clean may not be 100% but search is already on v2."
+      "Comment": "Workflow complete. Search is on v2, old field cleaned (best effort)."
     },
 
     "Failed": {

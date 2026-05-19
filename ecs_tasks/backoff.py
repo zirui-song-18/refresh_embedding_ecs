@@ -47,6 +47,7 @@ class AdaptiveBackoff:
                 self._delay = 0.0
 
     def wait(self):
+        import random
         delay = self.delay
         if delay > 0:
-            time.sleep(delay)
+            time.sleep(delay * (0.5 + random.random()))  # jitter: [0.5*d, 1.5*d)

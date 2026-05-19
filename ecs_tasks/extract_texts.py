@@ -1,5 +1,6 @@
-"""ECS Task: Extract all texts missing v2 from AOSS, write to S3 as JSONL chunks.
+"""ECS Task: Extract all document texts from AOSS, write to S3 as JSONL chunks.
 
+Extracts all documents that have the text field populated (no v2_field filter).
 Runs to completion — no 15-min limit, no Step Function event overhead.
 Single invocation handles the entire extraction (PIT + search_after loop).
 """
@@ -24,18 +25,16 @@ CHUNK_SIZE = int(os.environ.get("CHUNK_SIZE", "50000"))
 def main():
     endpoint = os.environ["COLLECTION_ENDPOINT"]
     index_name = os.environ["INDEX_NAME"]
-    v2_field = os.environ["V2_FIELD"]
     text_field = os.environ["TEXT_FIELD"]
     s3_bucket = os.environ["S3_BUCKET"]
     s3_prefix = os.environ["S3_PREFIX"]
 
-    logger.info(f"ExtractTexts starting: index={index_name}, v2_field={v2_field}")
+    logger.info(f"ExtractTexts starting: index={index_name}, text_field={text_field}")
     logger.info(f"Output: s3://{s3_bucket}/{s3_prefix}/texts/")
 
-    # Clean up old data from previous round (needed for retry loops)
+    # Clean up old text data from previous round
     _cleanup_s3_prefix(s3_bucket, f"{s3_prefix}/texts/")
-    _cleanup_s3_prefix(s3_bucket, f"{s3_prefix}/embeddings/")
-    logger.info("Cleaned up old texts/ and embeddings/ from S3")
+    logger.info("Cleaned up old texts/ from S3")
 
     # Create PIT
     pit_resp = aoss_request(
@@ -43,7 +42,7 @@ def main():
         f"{index_name}/_search/point_in_time?keep_alive=15m",
     )
     pit_id = pit_resp["pit_id"]
-    logger.info(f"PIT created")
+    logger.info("PIT created")
 
     total_extracted = 0
     chunk_num = 0
@@ -53,13 +52,13 @@ def main():
 
     try:
         while True:
-            # Search for docs missing v2
+            # Search for docs that have the text field populated
             search_body = {
                 "size": SEARCH_PAGE_SIZE,
                 "_source": [text_field],
-                "query": {"bool": {"must_not": {"exists": {"field": v2_field}}}},
+                "query": {"exists": {"field": text_field}},
                 "pit": {"id": pit_id, "keep_alive": "15m"},
-                "sort": [{"_doc": "asc"}],
+                "sort": [{"_doc": "asc"}, {"_id": "asc"}],
             }
             if search_after:
                 search_body["search_after"] = search_after
@@ -122,8 +121,7 @@ def main():
     logger.info(f"Summary written to s3://{s3_bucket}/{s3_prefix}/extract_summary.json")
 
     if total_extracted == 0:
-        logger.warning("No documents extracted — all docs may already have v2 (expected on final retry)")
-        # Do NOT exit 1 here: retry loop may reach this state legitimately
+        logger.warning("No documents extracted — index may have no docs with text field")
 
 
 def _cleanup_s3_prefix(s3_bucket, prefix):
